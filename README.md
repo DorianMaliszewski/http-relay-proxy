@@ -27,6 +27,8 @@ I choose Rust because I did some projects using Java, JS and Go and wanted to tr
 
 ## Tests
 
+Actually I need to implement them. I'm doing them manually (boring).
+
 - [ ] Passthrough
 - [ ] Recording
   - [ ] Start session
@@ -58,7 +60,7 @@ I choose Rust because I did some projects using Java, JS and Go and wanted to tr
 **Request are identified with : `METHOD : URL`.**
 
 - Proxy has 3 options : passthrough, recording, replaying. The mode is selected based on options you pass to the cli.
-- When running in recording or replaying you need to made 2 calls: one to start the session and one to end (otherwise maybe meme issue).
+- When running in recording or replaying you need to made 2 calls: one to start the session and one to end (otherwise memory issue ?).
 - When starting a session it will add a cookie to your headers to identify your session id
 - Based on this session id it will retrieve records (replay), or store them in memory (record).
 - Save only happen when you stop the session. In record mode save the file with suffix .snap in JSON format.
