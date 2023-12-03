@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::Mutex};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Mutex};
 
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
@@ -7,7 +7,7 @@ pub struct RecordOptions {
     pub record_dir: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RecordSession {
     pub states: HashMap<String, usize>,
     pub filepath: String,
@@ -18,7 +18,7 @@ pub struct SessionState {
     pub sessions: Mutex<HashMap<String, RecordSession>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Record {
     pub status: String,
     pub headers: HashMap<String, String>,
