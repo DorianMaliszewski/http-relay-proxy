@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct RecordOptions {

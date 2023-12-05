@@ -98,12 +98,8 @@ async fn test_recording_mode_start_then_a_request_then_end() {
     res = test::call_service(&app, req).await;
     assert!(res.status().is_success());
     assert!(fs::metadata("./.tmp/test2.snap").is_ok());
-    let content: HashMap<String, Vec<Record>> = serde_json::from_str(
-        fs::read_to_string("./.tmp/test2.snap")
-            .unwrap()
-            .as_str(),
-    )
-    .unwrap();
+    let content: HashMap<String, Vec<Record>> =
+        serde_json::from_str(fs::read_to_string("./.tmp/test2.snap").unwrap().as_str()).unwrap();
     assert!(content.contains_key("GET:/todos/1"));
     assert!(fs::remove_file("./.tmp/test2.snap").is_ok());
 }
@@ -160,12 +156,8 @@ async fn test_recording_mode_start_then_multiple_requests_then_end() {
     res = test::call_service(&app, req).await;
     assert!(res.status().is_success());
     assert!(fs::metadata("./.tmp/test3.snap").is_ok());
-    let content: HashMap<String, Vec<Record>> = serde_json::from_str(
-        fs::read_to_string("./.tmp/test3.snap")
-            .unwrap()
-            .as_str(),
-    )
-    .unwrap();
+    let content: HashMap<String, Vec<Record>> =
+        serde_json::from_str(fs::read_to_string("./.tmp/test3.snap").unwrap().as_str()).unwrap();
     assert!(content.contains_key("GET:/todos/1"));
     assert!(content.contains_key("GET:/todos/2"));
     assert_eq!(content.get("GET:/todos/1").unwrap().len(), 2);

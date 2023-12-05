@@ -1,10 +1,9 @@
 use clap::Parser;
 use cli::*;
 
+mod app;
 mod cli;
 mod records;
-mod app;
-
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {

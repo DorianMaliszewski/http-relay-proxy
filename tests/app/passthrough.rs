@@ -1,7 +1,7 @@
 use crate::helpers::create_app;
 use actix_web::test;
 use http_replay_proxy::cli::CliArguments;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -9,7 +9,7 @@ struct User {
     user_id: i128,
     id: i128,
     title: String,
-    completed: bool
+    completed: bool,
 }
 
 #[actix_web::test]
@@ -26,7 +26,6 @@ async fn test_passthrough_mode_status() {
     let req = test::TestRequest::get().uri("/todos/1").to_request();
     let res = test::call_service(&app, req).await;
     assert!(res.status().is_success());
-
 }
 
 #[actix_web::test]
@@ -44,5 +43,4 @@ async fn test_passthrough_mode_body() {
     let res: User = test::call_and_read_body_json(&app, req).await;
 
     assert_eq!(res.id, 1);
-
 }

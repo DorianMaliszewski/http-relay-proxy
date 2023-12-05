@@ -103,7 +103,6 @@ async fn test_replaying_mode_start_then_a_request_then_end() {
         .to_request();
     res = test::call_service(&app, req).await;
     assert!(res.status().is_success());
-
 }
 
 #[actix_web::test]

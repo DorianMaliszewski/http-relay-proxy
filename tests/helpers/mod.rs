@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
 
 use actix_session::{config::BrowserSession, storage::CookieSessionStore, SessionMiddleware};
 use actix_web::{
@@ -6,10 +6,17 @@ use actix_web::{
     dev::{ServiceFactory, ServiceRequest, ServiceResponse},
     web, App,
 };
-use http_replay_proxy::{cli::CliArguments, records::{RecordOptions, SessionState, RecordSession}, app::{forward, end_record_handler, start_record_handler}};
+use http_replay_proxy::{
+    app::{end_record_handler, forward, start_record_handler},
+    cli::CliArguments,
+    records::{RecordOptions, RecordSession, SessionState},
+};
+use tokio::sync::Mutex;
 use url::Url;
 
-pub async fn create_app(args: CliArguments) -> App<
+pub async fn create_app(
+    args: CliArguments,
+) -> App<
     impl ServiceFactory<
         ServiceRequest,
         Config = (),
@@ -30,7 +37,7 @@ pub async fn create_app(args: CliArguments) -> App<
     });
 
     let reqwest_client = reqwest::Client::default();
-    return App::new()
+    App::new()
         .app_data(web::Data::new(reqwest_client.clone()))
         .app_data(web::Data::new(forward_url.clone()))
         .app_data(web::Data::new(record_options.clone()))
@@ -45,5 +52,5 @@ pub async fn create_app(args: CliArguments) -> App<
         )
         .route("/end-record", web::post().to(end_record_handler))
         .route("/start-record/{name}", web::post().to(start_record_handler))
-        .default_service(web::to(forward));
+        .default_service(web::to(forward))
 }
