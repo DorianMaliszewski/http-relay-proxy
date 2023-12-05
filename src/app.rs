@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::cli::*;
 use crate::records::*;
 
-/// Forwards the incoming HTTP request using `awc`.
+/// Forwards the incoming HTTP request.
 pub async fn forward(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -203,6 +203,7 @@ pub async fn forward(
     return Ok(client_resp.streaming(res.bytes_stream()));
 }
 
+// Start a record session
 pub async fn start_record_handler(
     session: Session,
     path: web::Path<String>,
@@ -231,6 +232,7 @@ pub async fn start_record_handler(
     };
 }
 
+// End a record session
 pub async fn end_record_handler(
     session: Session,
     record_options: web::Data<RecordOptions>,
@@ -265,6 +267,15 @@ pub async fn end_record_handler(
     } else {
         return Ok(HttpResponse::BadRequest().body("No session was started"));
     }
+}
+
+
+// Clear all sessions
+pub async fn clear_sessions(record_sessions: web::Data<SessionState>, session: Session) -> Result<HttpResponse, Error>{
+            let mut sessions_lock = record_sessions.sessions.lock().unwrap();
+            sessions_lock.clear();
+            session.clear();
+            return Ok(HttpResponse::Ok().body("Sessions cleared"));
 }
 
 pub async fn launch_app(args: CliArguments) -> std::io::Result<()> {
@@ -316,6 +327,9 @@ pub async fn launch_app(args: CliArguments) -> std::io::Result<()> {
             .service(web::resource("/end-record").route(web::post().to(end_record_handler)))
             .service(
                 web::resource("/start-record/{name}").route(web::post().to(start_record_handler)),
+            )
+            .service(
+                web::resource("/clear-sessions").route(web::post().to(clear_sessions)),
             )
             .default_service(web::to(forward))
     })

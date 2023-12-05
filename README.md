@@ -1,4 +1,4 @@
-# http-relay-proxy: Record and replay your calls (ACTIVE DEVELOPMENT)
+# http-replay-proxy: Record and replay your calls (ACTIVE DEVELOPMENT)
 
 My first serious project in rust for the dev community. :D
 
@@ -42,12 +42,11 @@ Actually I need to implement them. I'm doing them manually (boring).
 
 ## Roadmap
 
-- [ ] Add some CI
+- [x] Add some CI. (Partial)
 - [ ] **Improve installation flow**.
-- [ ] Add testing (I'M SO BAD TO THIS NEED TO BE FIRST THING TO DO).
+- [x] Add testing (I'M SO BAD TO THIS NEED TO BE FIRST THING TO DO). (Golden paths)
 - [ ] When record found but a call is not present allow user to passthrough instead of raising 404.
 - [ ] Use a yaml file/env vars instead of CLI options.
-- [ ] Allow users to add header X-Forwarded-*;
 - [ ] Allow users to replay the last identifier multiple times.
 - [ ] Allow users to customize saved headers (exclude some headers, add static headers).
 - [ ] Benchmark memory usage, response times
@@ -83,8 +82,8 @@ Get the file of the record. When you make a call it will retrieve sequentially t
 I will try to improve this flow ! :')
 
 1. Clone this repository
-2. Build it : `cargo build`
-3. Go in build directory : `cd target/debug`
+2. Build it : `cargo build --release`
+3. Go in build directory : `cd target/release`
 4. Run `./http-replay-proxy` here
 
 ## How to Use
@@ -119,17 +118,25 @@ Options:
   -V, --version                    Print version
 ```
 
-### Passthrough mode (just relay)
+### Passthrough mode
 
 `./http-replay-proxy -f http://exemple.com`
 
-### Record calls
+### Record mode
 
 `./http-replay-proxy -f http://exemple.com -d ./dir_to_save_records -u`
 
-### Replay calls
+### Replay mode
 
 `./http-replay-proxy -f http://exemple.com -d ./dir_to_save_records`
+
+## More info
+
+- [With Docker](./docs/docker.md)
+
+## Potential issues
+
+- If you never end the record the sessions will grow in memory so it will take more RAM Usage (it keep the object with the records already stored in). Use POST on /clear-sessions to remove all
 
 ## Questioning
 
