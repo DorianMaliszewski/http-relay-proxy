@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
@@ -13,10 +12,6 @@ pub struct RecordSession {
     pub states: HashMap<String, usize>,
     pub filepath: String,
     pub records: HashMap<String, Vec<Record>>,
-}
-
-pub struct SessionState {
-    pub sessions: Mutex<HashMap<String, RecordSession>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

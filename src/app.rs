@@ -1,82 +1,140 @@
+use cookie::Cookie;
+use http::{HeaderName, HeaderValue, StatusCode};
 use std::{
     collections::HashMap,
     fs::{self},
     str::FromStr,
+    sync::Arc,
 };
 
-use actix_session::{
-    config::BrowserSession, storage::CookieSessionStore, Session, SessionMiddleware,
+use hyper_util::rt::TokioIo;
+use log::{debug, info, warn};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
-use actix_web::{
-    cookie::Key,
-    dev::PeerAddr,
-    http::StatusCode,
-    middleware,
-    web::{self},
-    App, Error, HttpRequest, HttpResponse, HttpServer,
-};
-use futures_util::StreamExt as _;
-use log::debug;
-use reqwest::Client;
-use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use url::Url;
 use uuid::Uuid;
 
-use crate::cli::*;
+use crate::config::Config;
 use crate::records::*;
+use std::net::SocketAddr;
 
-/// Forwards the incoming HTTP request.
-#[allow(clippy::too_many_arguments)]
-pub async fn forward(
-    req: HttpRequest,
-    mut payload: web::Payload,
-    url: web::Data<Url>,
-    client: web::Data<Client>,
-    record_options: web::Data<RecordOptions>,
-    session: Session,
-    record_sessions: web::Data<SessionState>,
-    peer_addr: Option<PeerAddr>,
-) -> Result<HttpResponse, Error> {
-    let use_record_dir = !record_options.record_dir.is_empty();
-    let mut new_url = (**url).clone();
-    new_url.set_path(req.uri().path());
-    new_url.set_query(req.uri().query());
-    let method = req.method().to_string();
-    let url = req.uri().to_string();
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
+use hyper::{body::Incoming, client::conn::http1::Builder};
+use hyper::{Method, Request, Response};
+
+struct State {
+    need_recording: bool,
+    sessions: Mutex<HashMap<String, RecordSession>>,
+    record_dir: String,
+    hosts: Vec<String>,
+}
+
+type AppState = Arc<State>;
+type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type Result<T> = std::result::Result<T, GenericError>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+const SET_COOKIE: &str = "Set-Cookie";
+
+
+pub async fn launch_app(config: Config, need_recording: bool) -> std::io::Result<()> {
+    if !config.record_dir.is_empty() {
+        if need_recording {
+            info!("MODE RECORD ENABLED");
+        } else {
+            info!("MODE REPLAY ENABLED");
+        }
+    } else {
+        info!("MODE PASSTHROUGH ENABLED");
+    }
+
+    info!(
+        "Starting proxy at {}:{}",
+        &config.listen_addr,
+        &config.listen_port
+    );
+
+
+    let addr =
+        SocketAddr::from_str(&format!("{}:{}", &config.listen_addr, &config.listen_port)).unwrap();
+
+    // We create a TcpListener and bind it to 127.0.0.1:3000
+    let listener = TcpListener::bind(addr).await?;
+    let app_state = Arc::new(State {
+        need_recording,
+        sessions: Mutex::new(HashMap::new()),
+        hosts: config.hosts_to_record,
+        record_dir: config.record_dir,
+    });
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let state = app_state.clone();
+
+        let service = service_fn(move |_req| handle_request(_req, state.clone()));
+
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+            {
+                warn!("Failed to serve connection: {:?}", err);
+            }
+        });
+    }
+}
+async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<Response<BoxBody>> {
+    let use_record_dir = !state.record_dir.is_empty();
+    let method = req.method().clone();
+    let url = req.uri().clone();
+    let host = url.host().expect("uri has no host");
+    let port = url.port_u16().unwrap_or(80);
     let identifier = format!("{}:{}", method, url).to_string();
 
-    debug!("Handle request : {}", identifier);
+    info!("Handle request : {}", identifier);
 
     if use_record_dir {
-        if let Some(session_id) = session.get::<String>("r-session")? {
-            let mut sessions_lock = record_sessions.sessions.lock().await;
+        if let Some(session_id) = get_session(&req) {
+            let mut sessions_lock = state.sessions.lock().await;
             let mut session = sessions_lock
                 .get(&session_id)
                 .expect("Could not get session")
                 .clone();
             let filepath = session.filepath.clone();
-            let state = *session.states.get(&identifier).unwrap_or(&0);
+            let record_state = *session.states.get(&identifier).unwrap_or(&0);
 
-            // Record dir and record mode off
-            if !record_options.record {
+            if !state.need_recording {
                 if fs::metadata(filepath.clone()).is_err() {
-                    Ok::<HttpResponse, Error>(HttpResponse::NotFound().body("No file found"))
+                    Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(full("No file found"))
+                        .unwrap())
                 } else {
                     let data =
                         fs::read_to_string(filepath.clone()).expect("Cannot read record file");
                     let record_file: HashMap<String, Vec<Record>> =
                         serde_json::from_str(data.as_str()).expect("Cannot parse record file");
                     if let Some(records) = record_file.get(&identifier) {
-                        if let Some(res) = records.get(state) {
+                        if let Some(res) = records.get(record_state) {
                             let status =
                                 StatusCode::from_str(&res.status).unwrap_or(StatusCode::OK);
 
-                            let mut client_resp = HttpResponse::build(status);
+                            let mut client_resp = Response::builder().status(status);
 
                             for (header_name, header_value) in res.headers.iter() {
-                                client_resp
-                                    .insert_header((header_name.clone(), header_value.clone()));
+                                client_resp.headers_mut().unwrap().insert(
+                                    HeaderName::from_str(header_name.as_str()).unwrap(),
+                                    HeaderValue::from_str(header_value.as_str()).unwrap(),
+                                );
                             }
 
                             let mut new_session = RecordSession {
@@ -85,49 +143,49 @@ pub async fn forward(
                                 records: session.records.clone(),
                             };
 
-                            new_session.states.insert(identifier, state + 1);
+                            new_session.states.insert(identifier, record_state + 1);
 
                             sessions_lock.insert(session_id, new_session);
 
-                            Ok(client_resp.body(res.body.clone()))
+                            Ok(client_resp.body(full(res.body.clone())).unwrap())
                         } else {
-                            Ok(HttpResponse::NotFound()
-                                .body(format!("No record in position {} found", state)))
+                            Ok(Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(full(format!(
+                                    "No record in position {} found",
+                                    record_state
+                                )))
+                                .unwrap())
                         }
                     } else {
-                        Ok(HttpResponse::NotFound().body("No identifier found"))
+                        Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(full("No identifier found"))
+                            .unwrap())
                     }
                 }
             } else {
-                let (tx, rx) = mpsc::unbounded_channel();
+                let stream = TcpStream::connect((host, port)).await.unwrap();
+                let io = TokioIo::new(stream);
 
-                actix_web::rt::spawn(async move {
-                    while let Some(chunk) = payload.next().await {
-                        tx.send(chunk).unwrap();
+
+                let (mut sender, conn) = Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .handshake(io)
+                    .await?;
+                tokio::task::spawn(async move {
+                    if let Err(err) = conn.await {
+                        warn!("Connection failed: {:?}", err);
                     }
                 });
 
-                let forwarded_req = client
-                    .request(req.method().clone(), new_url)
-                    .body(reqwest::Body::wrap_stream(UnboundedReceiverStream::new(rx)));
-
-                // TODO: This forwarded implementation is incomplete as it only handles the unofficial
-                // X-Forwarded-For header but not the official Forwarded one.
-                let forwarded_req = match peer_addr {
-                    Some(PeerAddr(addr)) => {
-                        forwarded_req.header("x-forwarded-for", addr.ip().to_string())
-                    }
-                    None => forwarded_req,
-                };
-
-                let res = forwarded_req
-                    .send()
-                    .await
-                    .map_err(actix_web::error::ErrorInternalServerError)?;
-
-                let res_status = res.status();
-                let res_headers = res.headers().clone();
-                let res_body = res.text().await.expect("Cannot get response");
+                let resp = sender.send_request(req).await?;
+                let res_status = resp.status();
+                let res_headers = resp.headers().clone();
+                let res_body =
+                    String::from_utf8(resp.into_body().collect().await?.to_bytes().to_vec())
+                        .unwrap_or(String::default());
 
                 let mut new_record = Record {
                     body: String::default(),
@@ -137,13 +195,16 @@ pub async fn forward(
 
                 new_record.body = res_body.clone();
 
-                let mut client_resp = HttpResponse::build(res_status);
+                let mut client_resp = Response::builder().status(res_status);
                 // Remove `Connection` as per
                 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives
                 for (header_name, header_value) in
                     res_headers.iter().filter(|(h, _)| *h != "connection")
                 {
-                    client_resp.insert_header((header_name.clone(), header_value.clone()));
+                    client_resp
+                        .headers_mut()
+                        .unwrap()
+                        .insert(header_name.clone(), header_value.clone());
                     new_record.headers.insert(
                         header_name.to_string(),
                         header_value.to_str().unwrap_or("").to_string(),
@@ -163,85 +224,95 @@ pub async fn forward(
                     .insert(identifier.clone(), record_array.to_vec());
                 sessions_lock.insert(session_id, session);
 
-                Ok(client_resp.body(res_body))
+                Ok(client_resp.body(full(res_body)).unwrap())
             }
         } else {
-            Ok(HttpResponse::BadRequest().body("No session started"))
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(full("No session started"))
+                .unwrap())
         }
     } else {
-        let (tx, rx) = mpsc::unbounded_channel();
+        if Method::CONNECT == req.method() {
+            if let Some(addr) = host_addr(req.uri()) {
+                tokio::task::spawn(async move {
+                    match hyper::upgrade::on(req).await {
+                        Ok(upgraded) => {
+                            if let Err(e) = tunnel(upgraded, addr).await {
+                                warn!("server io error: {}", e);
+                            };
+                        }
+                        Err(e) => warn!("upgrade error: {}", e),
+                    }
+                });
 
-        actix_web::rt::spawn(async move {
-            while let Some(chunk) = payload.next().await {
-                tx.send(chunk).unwrap();
+                Ok(Response::new(empty()))
+            } else {
+                warn!("CONNECT host is not socket addr: {:?}", req.uri());
+                let mut resp = Response::new(full("CONNECT must be to a socket address"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+
+                Ok(resp)
             }
-        });
+        } else {
+            let host = req.uri().host().expect("uri has no host");
+            let port = req.uri().port_u16().unwrap_or(80);
 
-        let forwarded_req = client
-            .request(req.method().clone(), new_url)
-            .body(reqwest::Body::wrap_stream(UnboundedReceiverStream::new(rx)));
+            let stream = TcpStream::connect((host, port)).await.unwrap();
+            let io = TokioIo::new(stream);
 
-        // TODO: This forwarded implementation is incomplete as it only handles the unofficial
-        // X-Forwarded-For header but not the official Forwarded one.
-        let forwarded_req = match peer_addr {
-            Some(PeerAddr(addr)) => forwarded_req.header("x-forwarded-for", addr.ip().to_string()),
-            None => forwarded_req,
-        };
+            let (mut sender, conn) = Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .handshake(io)
+                .await?;
+            tokio::task::spawn(async move {
+                if let Err(err) = conn.await {
+                    warn!("Connection failed: {:?}", err);
+                }
+            });
 
-        let res = forwarded_req
-            .send()
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-
-        let mut client_resp = HttpResponse::build(res.status());
-        // Remove `Connection` as per
-        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives
-        for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection")
-        {
-            client_resp.insert_header((header_name.clone(), header_value.clone()));
+            let resp = sender.send_request(req).await?;
+            Ok(resp.map(|b| b.boxed()))
         }
-
-        Ok(client_resp.streaming(res.bytes_stream()))
     }
 }
 
 // Start a record session
-pub async fn start_record_handler(
-    session: Session,
-    path: web::Path<String>,
-    record_options: web::Data<RecordOptions>,
-    record_sessions: web::Data<SessionState>,
-) -> HttpResponse {
-    let mut sessions_lock = record_sessions.sessions.lock().await;
-    let record_name = path.into_inner();
+async fn start_record_handler(
+    req: Request<Incoming>,
+    state: AppState,
+) -> Result<Response<BoxBody>> {
+    let mut sessions_lock = state.sessions.lock().await;
+    let record_name = req.uri().query().unwrap();
     let session_id = Uuid::new_v4();
     let record_session = RecordSession {
         filepath: format!(
             "{}/{}.snap",
-            record_options.record_dir.trim_end_matches('/'),
+            state.record_dir.trim_end_matches('/'),
             record_name
         ),
         states: HashMap::new(),
         records: HashMap::new(),
     };
     sessions_lock.insert(session_id.to_string(), record_session);
-    match session.insert("r-session", session_id.to_string()) {
-        Ok(_) => HttpResponse::Ok().body("Session started"),
-        Err(_) => HttpResponse::InternalServerError().body("Session error"),
-    }
+    let mut res = Response::default();
+    let cookie = Cookie::build(("r-session", session_id.to_string()))
+        .http_only(true)
+        .build();
+    res.headers_mut()
+        .append(SET_COOKIE, cookie.to_string().parse().unwrap());
+    *res.status_mut() = StatusCode::OK;
+    Ok(res)
 }
 
 // End a record session
-pub async fn end_record_handler(
-    session: Session,
-    record_options: web::Data<RecordOptions>,
-    record_sessions: web::Data<SessionState>,
-) -> Result<HttpResponse, Error> {
-    if let Some(session_id) = session.get::<String>("r-session")? {
-        let was_recording = !record_options.record_dir.is_empty() && record_options.record;
+async fn end_record_handler(req: Request<Incoming>, state: AppState) -> Result<Response<BoxBody>> {
+    if let Some(session_id) = get_session(&req) {
+        let was_recording = !state.record_dir.is_empty() && state.need_recording;
 
         if was_recording {
-            let mut sessions_lock = record_sessions.sessions.lock().await;
+            let mut sessions_lock = state.sessions.lock().await;
             let record_session = sessions_lock
                 .get(&session_id)
                 .expect("Could not get session");
@@ -254,85 +325,87 @@ pub async fn end_record_handler(
 
             let data = serde_json::to_string(&record_session.records)
                 .expect("Cannot parse in-memory records");
-            fs::create_dir_all(&record_options.record_dir)?;
+            fs::create_dir_all(&state.record_dir).expect("Cannot create dir");
             debug!("Writing to {}", filepath);
             fs::write(filepath, data).expect("Cannot write to file");
 
             sessions_lock.remove(&session_id);
-            Ok(HttpResponse::Ok().body("Record saved"))
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(full("Record saved"))
+                .unwrap())
         } else {
-            Ok(HttpResponse::Ok().body("Not recording"))
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(full("Not recording"))
+                .unwrap())
         }
     } else {
-        Ok(HttpResponse::BadRequest().body("No session was started"))
+        Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full("No session was started"))
+            .unwrap())
     }
 }
 
 // Clear all sessions
-pub async fn clear_sessions(
-    record_sessions: web::Data<SessionState>,
-    session: Session,
-) -> Result<HttpResponse, Error> {
-    let mut sessions_lock = record_sessions.sessions.lock().await;
+async fn clear_sessions(state: AppState) -> Result<Response<BoxBody>> {
+    let mut sessions_lock = state.sessions.lock().await;
     sessions_lock.clear();
-    session.clear();
-    Ok(HttpResponse::Ok().body("Sessions cleared"))
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(full("Sessions cleared"))
+        .unwrap())
 }
 
-pub async fn launch_app(args: CliArguments) -> std::io::Result<()> {
-    let forward_url = Url::parse(&args.forward_to).expect("Forward address invalid");
-
-    if !args.record_dir.is_empty() {
-        if args.record {
-            log::info!("MODE RECORD ENABLED");
-        } else {
-            log::info!("MODE REPLAY ENABLED");
-        }
-    } else {
-        log::info!("MODE PASSTHROUGH ENABLED");
+async fn handle_request(req: Request<Incoming>, state: AppState) -> Result<Response<BoxBody>> {
+    match (req.method(), req.uri().path()) {
+        (&Method::POST, "/start_record") => start_record_handler(req, state).await,
+        (&Method::POST, "/end_record") => end_record_handler(req, state).await,
+        (&Method::POST, "/clear-sessions") => clear_sessions(state).await,
+        _ => proxy(req, state).await,
     }
+}
 
-    log::info!(
-        "Starting proxy at http://{}:{}",
-        &args.listen_addr,
-        &args.port
+fn host_addr(uri: &http::Uri) -> Option<String> {
+    uri.authority().and_then(|auth| Some(auth.to_string()))
+}
+
+fn empty() -> BoxBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn get_session(req: &Request<hyper::body::Incoming>) -> Option<String> {
+    let cookie_header = req.headers().get("cookie").expect("No cookie header found");
+    let mut cookies =
+        Cookie::split_parse_encoded(cookie_header.to_str().expect("Cannot parse Cookie header"))
+            .map(|c| c.unwrap());
+
+    return cookies
+        .find(|c| c.name() == "r-session")
+        .map(|c| c.value().to_string());
+}
+
+// Create a TCP connection to host:port, build a tunnel between the connection and the upgraded connection
+async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
+    let mut server = TcpStream::connect(addr.clone()).await?;
+    let mut upgraded = TokioIo::new(upgraded);
+
+    // Proxying data
+    let (from_client, from_server) =
+        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
+
+    debug!(
+        "client wrote {} bytes and received {} bytes",
+        from_client, from_server
     );
-
-    log::info!("Forward request to {forward_url}");
-
-    let record_options = RecordOptions {
-        record_dir: args.record_dir,
-        record: args.record,
-    };
-
-    let record_sessions = web::Data::new(SessionState {
-        sessions: Mutex::new(HashMap::<String, RecordSession>::new()),
-    });
-    let reqwest_client = reqwest::Client::default();
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(reqwest_client.clone()))
-            .app_data(web::Data::new(forward_url.clone()))
-            .app_data(web::Data::new(record_options.clone()))
-            .app_data(record_sessions.clone())
-            .wrap(middleware::Logger::default())
-            .wrap(
-                SessionMiddleware::builder(CookieSessionStore::default(), Key::from(&[0; 64]))
-                    .cookie_secure(false)
-                    .cookie_name("r-session".to_string())
-                    .session_lifecycle(BrowserSession::default())
-                    .cookie_http_only(true)
-                    .build(),
-            )
-            .service(web::resource("/end-record").route(web::post().to(end_record_handler)))
-            .service(
-                web::resource("/start-record/{name}").route(web::post().to(start_record_handler)),
-            )
-            .service(web::resource("/clear-sessions").route(web::post().to(clear_sessions)))
-            .default_service(web::to(forward))
-    })
-    .bind(format!("{}:{}", args.listen_addr, args.port))?
-    .run()
-    .await
+    Ok(())
 }
