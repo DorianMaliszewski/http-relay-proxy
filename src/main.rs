@@ -1,3 +1,5 @@
+use std::fs;
+
 use clap::Parser;
 use cli::*;
 use config::Config;
@@ -6,16 +8,12 @@ mod app;
 mod cli;
 mod config;
 mod records;
-mod tokiort;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-    let mut config = get_default_config();
-
-    if let f = std::fs::File::open("config.yml") {
-        config = serde_yaml::from_reader(f).expect("Error when parsing config");
-    };
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
+    let f = fs::read_to_string("config.yml").expect("Cannot read file");
+    let config = serde_yaml::from_str(f.as_str()).unwrap_or(get_default_config());
 
     let args = CliArguments::parse();
 
@@ -24,9 +22,9 @@ async fn main() -> std::io::Result<()> {
 
 pub fn get_default_config() -> Config {
     Config {
-        hosts_to_record: [".*"],
+        hosts_to_record: [".*".to_string()].to_vec(),
         listen_addr: "0.0.0.0".to_string(),
         listen_port: 3333,
-        record_dir: "./.tmp".to_string(),
+        record_dir: "".to_string(),
     }
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use hyper_util::rt::TokioIo;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
@@ -41,105 +41,24 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 const SET_COOKIE: &str = "Set-Cookie";
 
-// Start a record session
-pub async fn start_record_handler(
-    req: Request<Incoming>,
-    state: AppState,
-) -> Result<Response<BoxBody>> {
-    let mut sessions_lock = state.sessions.lock().await;
-    let record_name = req.uri().query().unwrap();
-    let session_id = Uuid::new_v4();
-    let record_session = RecordSession {
-        filepath: format!(
-            "{}/{}.snap",
-            state.record_dir.trim_end_matches('/'),
-            record_name
-        ),
-        states: HashMap::new(),
-        records: HashMap::new(),
-    };
-    sessions_lock.insert(session_id.to_string(), record_session);
-    let mut res = Response::default();
-    let cookie = Cookie::build(("r-session", session_id.to_string()))
-        .http_only(true)
-        .build();
-    res.headers_mut()
-        .append(SET_COOKIE, cookie.to_string().parse().unwrap());
-    *res.status_mut() = StatusCode::OK;
-    Ok(res)
-}
-
-// End a record session
-pub async fn end_record_handler(
-    req: Request<Incoming>,
-    state: AppState,
-) -> Result<Response<BoxBody>> {
-    if let Some(session_id) = get_session(req) {
-        let was_recording = !state.record_dir.is_empty() && state.need_recording;
-
-        if was_recording {
-            let mut sessions_lock = state.sessions.lock().await;
-            let record_session = sessions_lock
-                .get(&session_id)
-                .expect("Could not get session");
-            let filepath = record_session.filepath.clone();
-
-            debug!(
-                "Number of records to write : {}",
-                record_session.records.len()
-            );
-
-            let data = serde_json::to_string(&record_session.records)
-                .expect("Cannot parse in-memory records");
-            fs::create_dir_all(&state.record_dir);
-            debug!("Writing to {}", filepath);
-            fs::write(filepath, data).expect("Cannot write to file");
-
-            sessions_lock.remove(&session_id);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(full("Record saved"))
-                .unwrap())
-        } else {
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(full("Not recording"))
-                .unwrap())
-        }
-    } else {
-        Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(full("No session was started"))
-            .unwrap())
-    }
-}
-
-// Clear all sessions
-pub async fn clear_sessions(state: AppState) -> Result<Response<BoxBody>> {
-    let mut sessions_lock = state.sessions.lock().await;
-    sessions_lock.clear();
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .body(full("Sessions cleared"))
-        .unwrap())
-}
 
 pub async fn launch_app(config: Config, need_recording: bool) -> std::io::Result<()> {
     if !config.record_dir.is_empty() {
         if need_recording {
-            log::info!("MODE RECORD ENABLED");
+            info!("MODE RECORD ENABLED");
         } else {
-            log::info!("MODE REPLAY ENABLED");
+            info!("MODE REPLAY ENABLED");
         }
     } else {
-        log::info!("MODE PASSTHROUGH ENABLED");
+        info!("MODE PASSTHROUGH ENABLED");
     }
 
-    log::info!(
-        "Starting proxy at http://{}:{}",
+    info!(
+        "Starting proxy at {}:{}",
         &config.listen_addr,
         &config.listen_port
     );
+
 
     let addr =
         SocketAddr::from_str(&format!("{}:{}", &config.listen_addr, &config.listen_port)).unwrap();
@@ -149,8 +68,8 @@ pub async fn launch_app(config: Config, need_recording: bool) -> std::io::Result
     let app_state = Arc::new(State {
         need_recording,
         sessions: Mutex::new(HashMap::new()),
-        hosts: config.hosts_to_record.clone(),
-        record_dir: config.record_dir.clone(),
+        hosts: config.hosts_to_record,
+        record_dir: config.record_dir,
     });
 
     loop {
@@ -168,23 +87,23 @@ pub async fn launch_app(config: Config, need_recording: bool) -> std::io::Result
                 .with_upgrades()
                 .await
             {
-                println!("Failed to serve connection: {:?}", err);
+                warn!("Failed to serve connection: {:?}", err);
             }
         });
     }
 }
 async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<Response<BoxBody>> {
     let use_record_dir = !state.record_dir.is_empty();
-    let method = req.method();
+    let method = req.method().clone();
     let url = req.uri().clone();
     let host = url.host().expect("uri has no host");
     let port = url.port_u16().unwrap_or(80);
     let identifier = format!("{}:{}", method, url).to_string();
 
-    debug!("Handle request : {}", identifier);
+    info!("Handle request : {}", identifier);
 
     if use_record_dir {
-        if let Some(session_id) = get_session(req) {
+        if let Some(session_id) = get_session(&req) {
             let mut sessions_lock = state.sessions.lock().await;
             let mut session = sessions_lock
                 .get(&session_id)
@@ -249,6 +168,7 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                 let stream = TcpStream::connect((host, port)).await.unwrap();
                 let io = TokioIo::new(stream);
 
+
                 let (mut sender, conn) = Builder::new()
                     .preserve_header_case(true)
                     .title_case_headers(true)
@@ -260,7 +180,7 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                     }
                 });
 
-                let resp = sender.send_request(req.).await?;
+                let resp = sender.send_request(req).await?;
                 let res_status = resp.status();
                 let res_headers = resp.headers().clone();
                 let res_body =
@@ -273,7 +193,7 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                     status: res_status.to_string(),
                 };
 
-                new_record.body = res_body;
+                new_record.body = res_body.clone();
 
                 let mut client_resp = Response::builder().status(res_status);
                 // Remove `Connection` as per
@@ -304,7 +224,7 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                     .insert(identifier.clone(), record_array.to_vec());
                 sessions_lock.insert(session_id, session);
 
-                Ok(resp.map(|b| b.boxed()))
+                Ok(client_resp.body(full(res_body)).unwrap())
             }
         } else {
             Ok(Response::builder()
@@ -319,16 +239,16 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                     match hyper::upgrade::on(req).await {
                         Ok(upgraded) => {
                             if let Err(e) = tunnel(upgraded, addr).await {
-                                eprintln!("server io error: {}", e);
+                                warn!("server io error: {}", e);
                             };
                         }
-                        Err(e) => eprintln!("upgrade error: {}", e),
+                        Err(e) => warn!("upgrade error: {}", e),
                     }
                 });
 
                 Ok(Response::new(empty()))
             } else {
-                eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
+                warn!("CONNECT host is not socket addr: {:?}", req.uri());
                 let mut resp = Response::new(full("CONNECT must be to a socket address"));
                 *resp.status_mut() = http::StatusCode::BAD_REQUEST;
 
@@ -348,7 +268,7 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
                 .await?;
             tokio::task::spawn(async move {
                 if let Err(err) = conn.await {
-                    println!("Connection failed: {:?}", err);
+                    warn!("Connection failed: {:?}", err);
                 }
             });
 
@@ -356,6 +276,86 @@ async fn proxy(req: Request<hyper::body::Incoming>, state: AppState) -> Result<R
             Ok(resp.map(|b| b.boxed()))
         }
     }
+}
+
+// Start a record session
+async fn start_record_handler(
+    req: Request<Incoming>,
+    state: AppState,
+) -> Result<Response<BoxBody>> {
+    let mut sessions_lock = state.sessions.lock().await;
+    let record_name = req.uri().query().unwrap();
+    let session_id = Uuid::new_v4();
+    let record_session = RecordSession {
+        filepath: format!(
+            "{}/{}.snap",
+            state.record_dir.trim_end_matches('/'),
+            record_name
+        ),
+        states: HashMap::new(),
+        records: HashMap::new(),
+    };
+    sessions_lock.insert(session_id.to_string(), record_session);
+    let mut res = Response::default();
+    let cookie = Cookie::build(("r-session", session_id.to_string()))
+        .http_only(true)
+        .build();
+    res.headers_mut()
+        .append(SET_COOKIE, cookie.to_string().parse().unwrap());
+    *res.status_mut() = StatusCode::OK;
+    Ok(res)
+}
+
+// End a record session
+async fn end_record_handler(req: Request<Incoming>, state: AppState) -> Result<Response<BoxBody>> {
+    if let Some(session_id) = get_session(&req) {
+        let was_recording = !state.record_dir.is_empty() && state.need_recording;
+
+        if was_recording {
+            let mut sessions_lock = state.sessions.lock().await;
+            let record_session = sessions_lock
+                .get(&session_id)
+                .expect("Could not get session");
+            let filepath = record_session.filepath.clone();
+
+            debug!(
+                "Number of records to write : {}",
+                record_session.records.len()
+            );
+
+            let data = serde_json::to_string(&record_session.records)
+                .expect("Cannot parse in-memory records");
+            fs::create_dir_all(&state.record_dir).expect("Cannot create dir");
+            debug!("Writing to {}", filepath);
+            fs::write(filepath, data).expect("Cannot write to file");
+
+            sessions_lock.remove(&session_id);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(full("Record saved"))
+                .unwrap())
+        } else {
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(full("Not recording"))
+                .unwrap())
+        }
+    } else {
+        Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full("No session was started"))
+            .unwrap())
+    }
+}
+
+// Clear all sessions
+async fn clear_sessions(state: AppState) -> Result<Response<BoxBody>> {
+    let mut sessions_lock = state.sessions.lock().await;
+    sessions_lock.clear();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(full("Sessions cleared"))
+        .unwrap())
 }
 
 async fn handle_request(req: Request<Incoming>, state: AppState) -> Result<Response<BoxBody>> {
@@ -383,7 +383,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
         .boxed()
 }
 
-fn get_session(req: Request<hyper::body::Incoming>) -> Option<String> {
+fn get_session(req: &Request<hyper::body::Incoming>) -> Option<String> {
     let cookie_header = req.headers().get("cookie").expect("No cookie header found");
     let mut cookies =
         Cookie::split_parse_encoded(cookie_header.to_str().expect("Cannot parse Cookie header"))
@@ -396,11 +396,16 @@ fn get_session(req: Request<hyper::body::Incoming>) -> Option<String> {
 
 // Create a TCP connection to host:port, build a tunnel between the connection and the upgraded connection
 async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
-    let mut server = TcpStream::connect(addr).await?;
+    let mut server = TcpStream::connect(addr.clone()).await?;
     let mut upgraded = TokioIo::new(upgraded);
 
     // Proxying data
-    tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
+    let (from_client, from_server) =
+        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
 
+    debug!(
+        "client wrote {} bytes and received {} bytes",
+        from_client, from_server
+    );
     Ok(())
 }
